@@ -1,6 +1,7 @@
 import Peer, { PeerErrorType } from 'peerjs';
 import type { DataConnection, PeerError } from 'peerjs';
-import { NETWORK } from '../config/network';
+import { NETWORK, discoveryServers, turnOverride } from '../config/network';
+import { DEFAULT_ENABLED, DEFAULT_RELAY, resolveEnabled, resolveRelay } from '../config/iceServers';
 import type { Channel, ChannelMessage, CloseReason } from './channel';
 
 export const DEFAULT_JOIN_TIMEOUT_MS = 30000;
@@ -149,6 +150,23 @@ export interface JoinResult {
   channel: PeerChannel;
 }
 
+export interface IceSelection {
+  enabled: readonly number[];
+  relay: number;
+}
+
+// The selection may already name the designated relay, and naming a server twice
+// is a second gather request against it. The check is by object identity rather
+// than index: `resolveRelay` falls back to the default for a non-relay or unknown
+// index, and an index comparison could disagree with it, appending a duplicate
+// fallback or leaving the config with no relay at all.
+export function iceConfigFor(selection: IceSelection): RTCIceServer[] {
+  const enabled = resolveEnabled(selection.enabled);
+  const relay = resolveRelay(selection.relay);
+  if (enabled.includes(relay)) return enabled;
+  return [...enabled, relay];
+}
+
 export class PeerSession {
   private readonly connectionHandlers: ((channel: PeerChannel) => void)[] = [];
   private readonly errorHandlers: ((error: SessionError) => void)[] = [];
@@ -170,14 +188,26 @@ export class PeerSession {
     });
   }
 
-  static open(roomId?: string): Promise<PeerSession> {
+  static open(
+    roomId?: string,
+    selection: IceSelection = { enabled: DEFAULT_ENABLED, relay: DEFAULT_RELAY },
+  ): Promise<PeerSession> {
     return new Promise((resolve, reject) => {
+      // Read fresh rather than off `NETWORK`, which snapshotted the env at
+      // import: a settings change has to reach sessions opened afterwards.
+      // An override replaces the relay and leaves discovery alone, because a
+      // fork naming its own relay still wants the cheap direct route tried
+      // first, and `discoveryServers()` is the same list the default config
+      // keeps rather than a filter re-derived here.
+      const turn = turnOverride();
       const options = {
         host: NETWORK.broker.host,
         port: NETWORK.broker.port,
         path: NETWORK.broker.path,
         secure: NETWORK.broker.secure,
-        config: { iceServers: NETWORK.iceServers },
+        config: {
+          iceServers: turn === null ? iceConfigFor(selection) : discoveryServers().concat(turn),
+        },
       };
       const peer = roomId === undefined ? new Peer(options) : new Peer(roomId, options);
       const onEarlyError = (error: PeerError<string>): void => {
@@ -193,8 +223,20 @@ export class PeerSession {
     });
   }
 
-  static async join(roomId: string, timeoutMs: number = DEFAULT_JOIN_TIMEOUT_MS): Promise<JoinResult> {
-    const session = await PeerSession.open();
+  static async join(
+    roomId: string,
+    relayIndex: number = DEFAULT_RELAY,
+    timeoutMs: number = DEFAULT_JOIN_TIMEOUT_MS,
+  ): Promise<JoinResult> {
+    // The receiver has no picker, so its selection stays the default and only
+    // the relay comes from the token. The index is not checked here: it is
+    // attacker-controlled and may come from a different build, and
+    // `resolveRelay` already falls back to the default for an index this build
+    // lacks or that names a server which cannot relay.
+    const session = await PeerSession.open(undefined, {
+      enabled: DEFAULT_ENABLED,
+      relay: relayIndex,
+    });
     const conn = session.peer.connect(roomId, { reliable: true, serialization: 'raw' });
 
     return new Promise<JoinResult>((resolve, reject) => {

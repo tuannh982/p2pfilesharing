@@ -69,7 +69,7 @@ const roundTrip = async (
   const receiver = new ReceiverEngine(
     b,
     await importRawKey(decoded.key),
-    { name, size: BigInt(size) },
+    { size: BigInt(size) },
     sink,
     { fileIndex: receiverIndex },
   );
@@ -117,7 +117,7 @@ describe('end-to-end round trip', () => {
     expect(sink.toUint8Array()).toEqual(new Uint8Array(0));
     expect(wire.filter(isFrame)).toHaveLength(0);
     expect(wire.filter(isControl).map(parseControl)).toEqual([
-      { t: 'offer', name: 'empty.bin', size: '0', chunkSize: CHUNK_SIZE },
+      { t: 'offer', chunkSize: CHUNK_SIZE },
       { t: 'done' },
     ]);
     expect(reply.filter(isControl).map(parseControl)).toEqual([{ t: 'accept' }, { t: 'done' }]);

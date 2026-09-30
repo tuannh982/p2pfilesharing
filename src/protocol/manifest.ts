@@ -1,4 +1,4 @@
-import { decryptChunk, encryptChunk } from '../crypto/chunks';
+import { buildBinding, decryptChunk, encryptChunk, MANIFEST_DOMAIN } from '../crypto/chunks';
 
 export const MANIFEST_FILE_INDEX = 0;
 export const MANIFEST_CHUNK_INDEX = 0n;
@@ -110,18 +110,37 @@ export function decodeManifest(bytes: Uint8Array): ManifestEntry[] {
   });
 }
 
+// Fixed zero, not the manifest's own length; chunks.ts explains why. A function
+// of nothing rather than a constant or a parameter: a caller that could pass a
+// size would one day pass the wrong one, with no error anywhere.
+export function manifestBinding(): Uint8Array<ArrayBuffer> {
+  return buildBinding(MANIFEST_DOMAIN, MANIFEST_FILE_INDEX, 0n);
+}
+
 export async function encryptManifest(
   key: CryptoKey,
   files: ManifestEntry[],
 ): Promise<ArrayBuffer> {
-  return encryptChunk(key, encodeManifest(files), MANIFEST_FILE_INDEX, MANIFEST_CHUNK_INDEX);
+  return encryptChunk(
+    key,
+    encodeManifest(files),
+    MANIFEST_FILE_INDEX,
+    MANIFEST_CHUNK_INDEX,
+    manifestBinding(),
+  );
 }
 
 export async function decryptManifest(
   key: CryptoKey,
   frame: ArrayBuffer,
 ): Promise<ManifestEntry[]> {
-  const plain = await decryptChunk(key, frame, MANIFEST_FILE_INDEX, MANIFEST_CHUNK_INDEX);
+  const plain = await decryptChunk(
+    key,
+    frame,
+    MANIFEST_FILE_INDEX,
+    MANIFEST_CHUNK_INDEX,
+    manifestBinding(),
+  );
   return decodeManifest(plain);
 }
 

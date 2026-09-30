@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  buildBinding,
+  CHUNK_DOMAIN,
   CHUNK_SIZE,
   TAG_BYTES,
   DecryptionError,
@@ -19,13 +21,16 @@ import {
   serializeControl,
   type ControlMessage,
 } from './messages';
+import { ReceiverSession, SenderSession } from './session';
 import {
   CLOSE_MESSAGES,
   DEFAULT_STALL_TIMEOUT_MS,
   DeliveryUnconfirmedError,
+  MAX_STEPPED_FRAMES,
   ReceiverEngine,
   SenderEngine,
   SenderStalledError,
+  TransferCancelledError,
   TransferDeclinedError,
   TransferStalledError,
   TruncatedTransferError,
@@ -54,6 +59,24 @@ const randomBlob = (size: number): Blob => {
 };
 
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 5));
+
+// A hang is a failure mode of its own, and one that only shows up as a bare
+// suite timeout. This gives a promise a deadline so a stalled engine says
+// which deadline it missed.
+const within = <T>(ms: number, promise: Promise<T>): Promise<T> =>
+  new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`nothing settled in ${ms}ms`)), ms);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (cause: unknown) => {
+        clearTimeout(timer);
+        reject(cause);
+      },
+    );
+  });
 
 interface Recorder {
   frames: ArrayBuffer[];
@@ -193,6 +216,36 @@ const pacedBlob = (size: number, gapMs: number): Blob => {
   } as Blob;
 };
 
+// A real signal, wrapped so a test can count what the engine adds to it and
+// what it hands back. Leaking one listener per chunk is invisible from the
+// outside, so it has to be measured rather than reasoned about.
+const countingSignal = (): {
+  signal: AbortSignal;
+  added: () => number;
+  removed: () => number;
+} => {
+  const controller = new AbortController();
+  let added = 0;
+  let removed = 0;
+  return {
+    signal: {
+      get aborted() {
+        return controller.signal.aborted;
+      },
+      addEventListener: (...args: Parameters<AbortSignal['addEventListener']>) => {
+        added += 1;
+        controller.signal.addEventListener(...args);
+      },
+      removeEventListener: (...args: Parameters<AbortSignal['removeEventListener']>) => {
+        removed += 1;
+        controller.signal.removeEventListener(...args);
+      },
+    } as unknown as AbortSignal,
+    added: () => added,
+    removed: () => removed,
+  };
+};
+
 const createPollingChannel = (): { channel: Channel; peak: () => number } => {
   let inflight = 0;
   let highWater = 0;
@@ -248,7 +301,7 @@ describe('SenderEngine', () => {
 
     expect(seen.frames).toHaveLength(0);
     expect(seen.controls).toEqual([
-      { t: 'offer', name: '', size: '0', chunkSize: CHUNK_SIZE },
+      { t: 'offer', chunkSize: CHUNK_SIZE },
       { t: 'done' },
     ]);
     expect(engine.state).toBe('completed');
@@ -302,7 +355,13 @@ describe('SenderEngine', () => {
 
     expect(seen.frames.length).toBe(2);
     for (let i = 0; i < seen.frames.length; i += 1) {
-      const got = await decryptChunk(key, seen.frames[i] as ArrayBuffer, FILE_INDEX, BigInt(i));
+      const got = await decryptChunk(
+        key,
+        seen.frames[i] as ArrayBuffer,
+        FILE_INDEX,
+        BigInt(i),
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, BigInt(size)),
+      );
       const start = i * CHUNK_SIZE;
       expect(got).toEqual(expected.subarray(start, start + got.length));
     }
@@ -372,7 +431,12 @@ describe('SenderEngine', () => {
     expect(engine.state).toBe('completed');
   });
 
-  it('stops and tells the peer when aborted mid-transfer', async () => {
+  it('stops when aborted mid-transfer, saying nothing to the peer', async () => {
+    // An abort is a receiver's cancel, and the receiver knows it asked. What
+    // tells the sender apart from one that stopped is what follows -- a select,
+    // or a closed channel -- so the frame that would claim otherwise is not just
+    // unnecessary, it is the one the receiver's drain is meant to end on instead
+    // of the terminator behind it.
     const { a, b } = createLoopbackPair();
     const seen = watch(b);
     playAcceptingReceiver(b);
@@ -389,7 +453,10 @@ describe('SenderEngine', () => {
 
     expect(engine.state).toBe('aborted');
     expect(seen.frames.length).toBeLessThan(500);
-    expect(seen.controls.at(-1)).toEqual({ t: 'error', message: 'The sender stopped sharing.' });
+    expect(
+      seen.controls.filter((c) => c.t === 'error'),
+      'the sender did not stop sharing, and the receiver is the one that knows why',
+    ).toEqual([]);
   });
 
   it('stops when the receiver disconnects', async () => {
@@ -424,7 +491,12 @@ describe('SenderEngine', () => {
     expect(seen.frames.length).toBeLessThan(500);
   });
 
-  it('sends the stopped message exactly once and never a done', async () => {
+  it('sends nothing past the offer when aborted, and never a done', async () => {
+    // The same path, asked of the whole frame sequence rather than of one frame:
+    // a file cut short owes the peer nothing, so the only control frames left on
+    // the wire are the offer it was answering and the ones the peer sent. A done
+    // here would be worse than silence -- it is the frame a receiver writes the
+    // file on.
     const { a, b } = createLoopbackPair();
     const seen = watch(b);
     playAcceptingReceiver(b);
@@ -439,11 +511,12 @@ describe('SenderEngine', () => {
     await engine.run(controller.signal);
     await settle();
 
-    const stopped = seen.controls.filter(
-      (c) => c.t === 'error' && c.message === 'The sender stopped sharing.',
-    );
-    expect(stopped).toHaveLength(1);
+    expect(
+      seen.controls.map((c) => c.t),
+      'a cut-short file is left unfinished in every way the wire can show',
+    ).toEqual(['offer']);
     expect(seen.controls).not.toContainEqual({ t: 'done' });
+    expect(seen.controls).not.toContainEqual({ t: 'cancelled' });
   });
 
   it('reports failed and rethrows when the channel throws mid-transfer', async () => {
@@ -504,7 +577,7 @@ describe('SenderEngine', () => {
     await settle();
 
     expect(peer.controls()).toEqual([
-      { t: 'offer', name: '', size: String(size), chunkSize: CHUNK_SIZE },
+      { t: 'offer', chunkSize: CHUNK_SIZE },
     ]);
     expect(peer.frames()).toHaveLength(0);
     expect(engine.state).toBe('sending');
@@ -546,7 +619,9 @@ describe('SenderEngine', () => {
 
     const running = engine.run();
     await settle();
-    peer.deliver(serializeControl({ t: 'error', message: 'This transfer does not match this link.' }));
+    // Whatever the peer said, verbatim. The text is the peer's to choose, so
+    // there is nothing here to match against production wording.
+    peer.deliver(serializeControl({ t: 'error', message: 'peer said no (arbitrary text)' }));
 
     await expect(running).resolves.toBeUndefined();
     expect(peer.frames()).toHaveLength(0);
@@ -661,7 +736,7 @@ describe('SenderEngine delivery confirmation', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       {
         write: () => Promise.reject(new Error('the disk is full')),
         close: () => Promise.resolve(),
@@ -744,7 +819,7 @@ describe('SenderEngine delivery confirmation', () => {
     const sink = new SpySink();
     const sender = new SenderEngine(a, randomBlob(size), key, { fileIndex: FILE_INDEX, pollIntervalMs: 0 });
     const receiver = new ReceiverEngine(b, key,
-      { name: '', size: BigInt(size) }, sink, { fileIndex: FILE_INDEX });
+      { size: BigInt(size) }, sink, { fileIndex: FILE_INDEX });
 
     const sending = sender.run();
     const receiving = receiver.run();
@@ -760,7 +835,6 @@ describe('ReceiverEngine', () => {
   const transfer = async (
     size: number,
     key: Uint8Array,
-    expectedName = '',
     tamper?: (frame: Uint8Array, index: number) => void,
   ) => {
     const keyHandle = await importRawKey(key);
@@ -794,7 +868,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       keyHandle,
-      { name: expectedName, size: BigInt(size) },
+      { size: BigInt(size) },
       sink,
       { fileIndex: FILE_INDEX, onStateChange: (s) => events.push(s) },
     );
@@ -826,7 +900,7 @@ describe('ReceiverEngine', () => {
     const size = CHUNK_SIZE + 11;
     const { a, b } = createLoopbackPair();
     const sink = new SpySink();
-    const receiver = new ReceiverEngine(b, key, { name: '', size: BigInt(size) }, sink, { fileIndex: FILE_INDEX,
+    const receiver = new ReceiverEngine(b, key, { size: BigInt(size) }, sink, { fileIndex: FILE_INDEX,
       onStateChange: (state) => {
         if (state === 'completed') throw new Error('caller blew up on completed');
       },
@@ -845,7 +919,7 @@ describe('ReceiverEngine', () => {
     const size = CHUNK_SIZE + 9;
     const { seen } = await transfer(size, await generateRawKey());
     expect(seen.controls).toEqual([
-      { t: 'offer', name: '', size: String(size), chunkSize: CHUNK_SIZE },
+      { t: 'offer', chunkSize: CHUNK_SIZE },
       { t: 'accept' },
       { t: 'done' },
       { t: 'done' },
@@ -858,11 +932,13 @@ describe('ReceiverEngine', () => {
     const sink = new MemorySink();
     const secret = randomBlob(500);
     const plain = new Uint8Array(await secret.arrayBuffer());
-    const receiver = new ReceiverEngine(b, key, { name: '', size: 500n }, sink, { fileIndex: FILE_INDEX });
+    const receiver = new ReceiverEngine(b, key, { size: 500n }, sink, { fileIndex: FILE_INDEX });
 
-    a.send(serializeControl({ t: 'offer', name: '', size: '500', chunkSize: CHUNK_SIZE }));
+    a.send(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    a.send(await encryptChunk(key, plain, FILE_INDEX, 0n));
+    a.send(
+      await encryptChunk(key, plain, FILE_INDEX, 0n, buildBinding(CHUNK_DOMAIN, FILE_INDEX, 500n)),
+    );
     a.send(serializeControl({ t: 'done' }));
     await settle();
 
@@ -889,7 +965,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       await importRawKey(key),
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       sink,
       { fileIndex: FILE_INDEX, onProgress: (received) => progress.push(received) },
     );
@@ -918,7 +994,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       {
         write: () => Promise.reject(new Error('the disk is full')),
         close: () => Promise.resolve(),
@@ -944,7 +1020,7 @@ describe('ReceiverEngine', () => {
 
   it('fails with DecryptionError when a ciphertext bit is flipped', async () => {
     await expect(
-      transfer(CHUNK_SIZE + 100, await generateRawKey(), '', (frame, i) => {
+      transfer(CHUNK_SIZE + 100, await generateRawKey(), (frame, i) => {
         if (i === 1) frame[5] = (frame[5] as number) ^ 0x01;
       }),
     ).rejects.toThrowError(/integrity check failed/i);
@@ -956,7 +1032,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       await importRawKey(await generateRawKey()),
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
@@ -974,7 +1050,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       await importRawKey(key),
-      { name: 'file.bin', size: 10n },
+      { size: 10n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
@@ -987,14 +1063,20 @@ describe('ReceiverEngine', () => {
     const { a, b } = createLoopbackPair();
     const sink = new SpySink();
     const receiver = new ReceiverEngine(b, key,
-      { name: 'file.bin', size: 1000n }, sink, { fileIndex: FILE_INDEX });
+      { size: 1000n }, sink, { fileIndex: FILE_INDEX });
     const receiving = receiver.run();
 
-    a.send(
-      serializeControl({ t: 'offer', name: 'file.bin', size: '1000', chunkSize: CHUNK_SIZE }),
-    );
+    a.send(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    a.send(await encryptChunk(key, new Uint8Array(400), FILE_INDEX, 0n));
+    a.send(
+      await encryptChunk(
+        key,
+        new Uint8Array(400),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, 1000n),
+      ),
+    );
     a.send(serializeControl({ t: 'done' }));
 
     await expect(receiving).rejects.toThrowError(TruncatedTransferError);
@@ -1008,7 +1090,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       await importRawKey(await generateRawKey()),
-      { name: 'file.bin', size: 100n },
+      { size: 100n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
@@ -1024,16 +1106,22 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'file.bin', size: 1000n },
+      { size: 1000n },
       sink, { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
 
-    peer.deliver(
-      serializeControl({ t: 'offer', name: 'file.bin', size: '1000', chunkSize: CHUNK_SIZE }),
-    );
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    peer.deliver(await encryptChunk(key, new Uint8Array(400), FILE_INDEX, 0n));
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(400),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, 1000n),
+      ),
+    );
     peer.drop('remote');
 
     await expect(receiving).rejects.toThrowError(/connection closed/i);
@@ -1049,7 +1137,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       await importRawKey(await generateRawKey()),
-      { name: 'file.bin', size: 100n },
+      { size: 100n },
       sink, { fileIndex: FILE_INDEX },
     );
 
@@ -1067,7 +1155,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       await importRawKey(await generateRawKey()),
-      { name: 'file.bin', size: 100n },
+      { size: 100n },
       sink, { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
@@ -1081,23 +1169,39 @@ describe('ReceiverEngine', () => {
     expect(sink.aborts).toBe(1);
   });
 
-  it('rejects an offer that disagrees with the token', async () => {
+  it('refuses a stream whose tag names a different file index', async () => {
+    const key = await importRawKey(await generateRawKey());
     const { a, b } = createLoopbackPair();
     const seen = watch(a);
+    const sink = new SpySink();
     const receiver = new ReceiverEngine(
       b,
-      await importRawKey(await generateRawKey()),
-      { name: 'expected.bin', size: 1000n },
-      new MemorySink(), { fileIndex: FILE_INDEX },
+      key,
+      { size: 1000n },
+      sink, { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
-    a.send(serializeControl({ t: 'offer', name: 'other.bin', size: '1000', chunkSize: CHUNK_SIZE }));
-    await expect(receiving).rejects.toThrowError(/does not match this link/i);
+
+    // The right key, a frame that fits the declared size, and an offer the
+    // receiver has no reason to refuse: the tag is the only thing that knows
+    // this stream was sealed for another file, so it has to be the gate.
+    a.send(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    expect(seen.controls).toEqual([
-      { t: 'error', message: 'This transfer does not match this link.' },
-    ]);
-    expect(seen.controls).not.toContainEqual({ t: 'accept' });
+    a.send(
+      await encryptChunk(
+        key,
+        new Uint8Array(400),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX + 1, 1000n),
+      ),
+    );
+
+    await expect(receiving).rejects.toThrowError(DecryptionError);
+    expect(sink.writes).toBe(0);
+    expect(sink.aborts).toBe(1);
+    expect(receiver.state).toBe('failed');
+    expect(seen.controls).toEqual([{ t: 'accept' }]);
   });
 
   it('rejects an offer with an unsupported chunk size', async () => {
@@ -1105,11 +1209,11 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       await importRawKey(await generateRawKey()),
-      { name: 'file.bin', size: 1000n },
+      { size: 1000n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
-    a.send(serializeControl({ t: 'offer', name: 'file.bin', size: '1000', chunkSize: 4096 }));
+    a.send(serializeControl({ t: 'offer', chunkSize: 4096 }));
     await expect(receiving).rejects.toThrowError(/chunk size/i);
   });
 
@@ -1119,13 +1223,21 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: 'file.bin', size: 10n },
+      { size: 10n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
-    a.send(serializeControl({ t: 'offer', name: 'file.bin', size: '10', chunkSize: CHUNK_SIZE }));
+    a.send(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    a.send(await encryptChunk(key, new Uint8Array(50), FILE_INDEX, 0n));
+    a.send(
+      await encryptChunk(
+        key,
+        new Uint8Array(50),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, 10n),
+      ),
+    );
     await expect(receiving).rejects.toThrowError(/more data than it declared/i);
   });
 
@@ -1136,15 +1248,23 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: 'file.bin', size: 10n },
+      { size: 10n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const decrypt = vi.spyOn(crypto.subtle, 'decrypt');
     try {
       const receiving = receiver.run();
-      a.send(serializeControl({ t: 'offer', name: 'file.bin', size: '10', chunkSize: CHUNK_SIZE }));
+      a.send(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
       await settle();
-      a.send(await encryptChunk(stranger, new Uint8Array(50), FILE_INDEX, 0n));
+      a.send(
+        await encryptChunk(
+          stranger,
+          new Uint8Array(50),
+          FILE_INDEX,
+          0n,
+          buildBinding(CHUNK_DOMAIN, FILE_INDEX, 10n),
+        ),
+      );
 
       await expect(receiving).rejects.toThrowError(/more data than it declared/i);
       expect(decrypt).not.toHaveBeenCalled();
@@ -1159,7 +1279,7 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'file.bin', size: 100n },
+      { size: 100n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
 
@@ -1178,19 +1298,19 @@ describe('ReceiverEngine', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'expected.bin', size: 1000n },
+      { size: 1000n },
       new MemorySink(), { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
 
-    peer.deliver(
-      serializeControl({ t: 'offer', name: 'other.bin', size: '1000', chunkSize: CHUNK_SIZE }),
-    );
+    // A refused offer is the one refusal that still has something to say: a
+    // stream it cannot authenticate is not refused at all, it fails later.
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: 4096 }));
 
-    await expect(receiving).rejects.toThrowError(/does not match this link/i);
+    await expect(receiving).rejects.toThrowError(/chunk size/i);
     await settle();
     expect(peer.sent).toEqual([
-      serializeControl({ t: 'error', message: 'This transfer does not match this link.' }),
+      serializeControl({ t: 'error', message: 'Unsupported chunk size 4096.' }),
     ]);
   });
 
@@ -1202,7 +1322,7 @@ describe('ReceiverEngine', () => {
       closes += 1;
     });
     const receiver = new ReceiverEngine(b, key,
-      { name: '', size: 10n }, new MemorySink(), { fileIndex: FILE_INDEX });
+      { size: 10n }, new MemorySink(), { fileIndex: FILE_INDEX });
     const receiving = receiver.run();
     await new SenderEngine(a, randomBlob(10), key, { fileIndex: FILE_INDEX, pollIntervalMs: 0 }).run();
     await receiving;
@@ -1225,17 +1345,23 @@ describe('ReceiverEngine stall timeout', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'file.bin', size: 1000n },
+      { size: 1000n },
       sink,
       { fileIndex: FILE_INDEX, stallTimeoutMs: 10 },
     );
 
     const receiving = receiver.run();
-    peer.deliver(
-      serializeControl({ t: 'offer', name: 'file.bin', size: '1000', chunkSize: CHUNK_SIZE }),
-    );
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    peer.deliver(await encryptChunk(key, new Uint8Array(400), FILE_INDEX, 0n));
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(400),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, 1000n),
+      ),
+    );
     await settle();
 
     await expect(receiving).rejects.toThrowError(TransferStalledError);
@@ -1250,7 +1376,7 @@ describe('ReceiverEngine stall timeout', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       await importRawKey(await generateRawKey()),
-      { name: 'file.bin', size: 100n },
+      { size: 100n },
       new MemorySink(),
       { fileIndex: FILE_INDEX, stallTimeoutMs: 10 },
     );
@@ -1267,17 +1393,33 @@ describe('ReceiverEngine stall timeout', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       sink,
       { fileIndex: FILE_INDEX, stallTimeoutMs: 500 },
     );
 
     const receiving = receiver.run();
-    peer.deliver(serializeControl({ t: 'offer', name: '', size: String(size), chunkSize: CHUNK_SIZE }));
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
-    peer.deliver(await encryptChunk(key, new Uint8Array(CHUNK_SIZE), FILE_INDEX, 0n));
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(CHUNK_SIZE),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, BigInt(size)),
+      ),
+    );
     await new Promise((resolve) => setTimeout(resolve, 150));
-    peer.deliver(await encryptChunk(key, new Uint8Array(1), FILE_INDEX, 1n));
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(1),
+        FILE_INDEX,
+        1n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, BigInt(size)),
+      ),
+    );
     peer.deliver(serializeControl({ t: 'done' }));
 
     await receiving;
@@ -1291,15 +1433,13 @@ describe('ReceiverEngine stall timeout', () => {
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'file.bin', size: 1000n },
+      { size: 1000n },
       new MemorySink(),
       { fileIndex: FILE_INDEX, stallTimeoutMs: 10 },
     );
 
     const receiving = receiver.run();
-    peer.deliver(
-      serializeControl({ t: 'offer', name: 'file.bin', size: '1000', chunkSize: CHUNK_SIZE }),
-    );
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
     await settle();
 
     const outcome = await receiving.catch((error: unknown) => error);
@@ -1311,7 +1451,7 @@ describe('ReceiverEngine stall timeout', () => {
     const key = await importRawKey(await generateRawKey());
     const { a, b } = createLoopbackPair();
     const receiver = new ReceiverEngine(b, key,
-      { name: '', size: 10n }, new MemorySink(), { fileIndex: FILE_INDEX,
+      { size: 10n }, new MemorySink(), { fileIndex: FILE_INDEX,
       stallTimeoutMs: 5,
     });
     const receiving = receiver.run();
@@ -1344,7 +1484,7 @@ describe('ReceiverEngine failure reporting', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       failingSink('the disk is full', 2), { fileIndex: FILE_INDEX },
     );
 
@@ -1368,7 +1508,7 @@ describe('ReceiverEngine failure reporting', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       failingSink('no space left on device', 1), { fileIndex: FILE_INDEX },
     );
 
@@ -1412,7 +1552,7 @@ describe('ReceiverEngine failure reporting', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: 10n },
+      { size: 10n },
       {
         write: () => Promise.resolve(),
         close: () => Promise.reject(new Error('the device went away')),
@@ -1440,7 +1580,7 @@ describe('ReceiverEngine failure reporting', () => {
     const receiver = new ReceiverEngine(
       b,
       key,
-      { name: '', size: BigInt(size) },
+      { size: BigInt(size) },
       failingSink('the disk is full', 1), { fileIndex: FILE_INDEX },
     );
 
@@ -1455,26 +1595,39 @@ describe('ReceiverEngine failure reporting', () => {
     expect(reasons).toHaveLength(1);
   });
 
-  it('still sends exactly one reason when the offer does not match the link', async () => {
+  it('sends nothing past the accept when the stream is bound to another file size', async () => {
     const key = await importRawKey(await generateRawKey());
     const peer = createManualPeer();
+    const sink = new SpySink();
     const receiver = new ReceiverEngine(
       peer.channel,
       key,
-      { name: 'expected.bin', size: 1000n },
-      new MemorySink(), { fileIndex: FILE_INDEX },
+      { size: 1000n },
+      sink, { fileIndex: FILE_INDEX },
     );
     const receiving = receiver.run();
 
+    // Right key, right file index, a frame that fits what this link expects,
+    // and a total in the binding that says the stream is a different file. The
+    // receiver has committed the accept and has nothing to report but the
+    // failure: it never writes the bytes, and it does not accuse the peer.
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
     peer.deliver(
-      serializeControl({ t: 'offer', name: 'other.bin', size: '1000', chunkSize: CHUNK_SIZE }),
+      await encryptChunk(
+        key,
+        new Uint8Array(400),
+        FILE_INDEX,
+        0n,
+        buildBinding(CHUNK_DOMAIN, FILE_INDEX, 2000n),
+      ),
     );
 
-    await expect(receiving).rejects.toThrowError(/does not match this link/i);
+    await expect(within(2000, receiving)).rejects.toThrowError(DecryptionError);
     await settle();
-    expect(peer.sent).toEqual([
-      serializeControl({ t: 'error', message: 'This transfer does not match this link.' }),
-    ]);
+    expect(peer.sent).toEqual([serializeControl({ t: 'accept' })]);
+    expect(sink.writes).toBe(0);
+    expect(sink.aborts).toBe(1);
   });
 
   it('does not blame the receiver for a close it did not cause', async () => {
@@ -1482,7 +1635,7 @@ describe('ReceiverEngine failure reporting', () => {
     const { a, b } = createLoopbackPair();
     const seen = watch(a);
     const receiver = new ReceiverEngine(b, key,
-      { name: '', size: 100n }, new MemorySink(), { fileIndex: FILE_INDEX });
+      { size: 100n }, new MemorySink(), { fileIndex: FILE_INDEX });
 
     const receiving = receiver.run();
     a.close();
@@ -1603,7 +1756,7 @@ describe('engine file index passthrough', () => {
     const secret = randomBlob(SIZE);
     const { a, b } = createLoopbackPair();
     const sink = new SpySink();
-    const receiver = new ReceiverEngine(b, key, { name: '', size: BigInt(SIZE) }, sink, {
+    const receiver = new ReceiverEngine(b, key, { size: BigInt(SIZE) }, sink, {
       fileIndex: receiverIndex,
     });
     const sender = new SenderEngine(a, secret, key, {
@@ -1664,9 +1817,10 @@ describe('engine file index passthrough', () => {
     expect(seen.frames).toHaveLength(2);
     for (let i = 0; i < seen.frames.length; i += 1) {
       const frame = seen.frames[i] as ArrayBuffer;
-      const got = await decryptChunk(key, frame, 2, BigInt(i));
+      const sealed = buildBinding(CHUNK_DOMAIN, 2, BigInt(size));
+      const got = await decryptChunk(key, frame, 2, BigInt(i), sealed);
       expect(got).toEqual(expected.subarray(i * CHUNK_SIZE, i * CHUNK_SIZE + got.length));
-      await expect(decryptChunk(key, frame, 0, BigInt(i))).rejects.toThrowError(DecryptionError);
+      await expect(decryptChunk(key, frame, 0, BigInt(i), sealed)).rejects.toThrowError(DecryptionError);
     }
   });
 
@@ -1690,5 +1844,1158 @@ describe('engine file index passthrough', () => {
     const fromFileOne = new Uint8Array(first.frames[0] as ArrayBuffer);
     const fromFileTwo = new Uint8Array(second.frames[0] as ArrayBuffer);
     expect(fromFileOne).not.toEqual(fromFileTwo);
+  });
+});
+
+describe('a sender streaming the wrong file', () => {
+  const NAME = 'a.bin';
+
+  it('fails on the first chunk when the stream is shorter than the link declares', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const { a, b } = createLoopbackPair();
+    const sink = new SpySink();
+    // Same name, same key, same file index, and a first frame that fits inside
+    // what the receiver declared: nothing on the wire says 1000 is not 2000.
+    const sender = new SenderEngine(a, new File([new Uint8Array(1000)], NAME), key, {
+      fileIndex: FILE_INDEX,
+      pollIntervalMs: 0,
+    });
+    const receiver = new ReceiverEngine(b, key, { size: 2000n }, sink, {
+      fileIndex: FILE_INDEX,
+    });
+
+    const receiving = receiver.run();
+    const sending = sender.run();
+    // A size disagreement has to be a failure and not a hang, and it has to be
+    // the integrity check rather than the truncation check: a sender that
+    // under-delivers would otherwise sail through as a short file.
+    await expect(within(2000, receiving)).rejects.toThrowError(DecryptionError);
+    await sending.catch(() => undefined);
+
+    expect(sink.writes).toBe(0);
+    expect(sink.aborts).toBe(1);
+    expect(sink.closes).toBe(0);
+    expect(receiver.state).toBe('failed');
+    expect(sender.state).not.toBe('completed');
+  });
+
+  it('fails when the stream is longer than the link declares', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const { a, b } = createLoopbackPair();
+    const sink = new SpySink();
+    const sender = new SenderEngine(a, new File([new Uint8Array(2000)], NAME), key, {
+      fileIndex: FILE_INDEX,
+      pollIntervalMs: 0,
+    });
+    const receiver = new ReceiverEngine(b, key, { size: 1000n }, sink, {
+      fileIndex: FILE_INDEX,
+    });
+
+    const receiving = receiver.run();
+    const sending = sender.run();
+    // The same disagreement from the other side is caught on the declared
+    // length, before anything is decrypted or written.
+    await expect(within(2000, receiving)).rejects.toThrowError(/more data than it declared/i);
+    await sending.catch(() => undefined);
+
+    expect(sink.writes).toBe(0);
+    expect(sink.aborts).toBe(1);
+    expect(receiver.state).toBe('failed');
+  });
+});
+
+describe('a cancelled transfer', () => {
+  // Not FILE_INDEX: the cancel frame has to carry the index this engine was
+  // built with, and a distinct one keeps a frame built from the wrong constant
+  // from passing.
+  const WIRE_INDEX = 4;
+
+  const firstChunk = (key: CryptoKey, size: bigint, length: number, index = 0n) =>
+    encryptChunk(
+      key,
+      new Uint8Array(length),
+      WIRE_INDEX,
+      index,
+      buildBinding(CHUNK_DOMAIN, WIRE_INDEX, size),
+    );
+
+  it('stops on the signal, aborts the sink, and leaves the channel open', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const { a, b } = createLoopbackPair();
+    const seen = watch(a);
+    let closes = 0;
+    a.onClose(() => {
+      closes += 1;
+    });
+    b.onClose(() => {
+      closes += 1;
+    });
+    const size = CHUNK_SIZE * 40;
+    const sink = new SpySink();
+    const states: ReceiverState[] = [];
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(b, key, { size: BigInt(size) }, sink, {
+      fileIndex: WIRE_INDEX,
+      onStateChange: (state) => states.push(state),
+      onProgress: () => controller.abort(),
+    });
+    const sending = new SenderEngine(a, randomBlob(size), key, {
+      fileIndex: WIRE_INDEX,
+      pollIntervalMs: 0,
+      // Short, because the wait this test now ends in is a wait for an
+      // acknowledgement that is never coming, and the default ceiling for that
+      // is a minute.
+      stallTimeoutMs: 200,
+    });
+
+    const receiving = receiver.run(controller.signal);
+    const streamed = sending.run();
+    // Held from the start: the sender meets the cancel long before this test
+    // gets round to looking at it, and an unwatched rejection in between is
+    // noise that hides a real one.
+    const senderFailure = streamed.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    await expect(receiving).rejects.toThrowError(TransferCancelledError);
+    expect(sink.aborts, 'the partial file is discarded, not finalised').toBe(1);
+    expect(sink.closes).toBe(0);
+    expect(states).toEqual(['idle', 'awaiting-offer', 'receiving', 'cancelled']);
+    expect(seen.controls).toContainEqual({ t: 'cancel', index: WIRE_INDEX });
+    expect(seen.controls.filter((c) => c.t === 'error')).toEqual([]);
+    expect(seen.controls).toContainEqual({ t: 'accept' });
+    // Nothing else in this test closes the channel, so any close at all would be
+    // the receiver's. The setTimeout in fail() is why this waits a turn.
+    await settle();
+    expect(closes).toBe(0);
+
+    // Nothing on this channel is going to answer that cancel: the sender's half
+    // of one is SenderSession's, and there is no session here. So the engine
+    // steps over the frame and goes on waiting for the receiver's own done,
+    // which the stall timer ends. Documented, not endorsed: what it must not do
+    // is read the cancel as a broken acknowledgement and fail the transfer over
+    // a file the receiver chose to skip. The session that would have answered
+    // it is exercised in session.test.ts.
+    const failure = await senderFailure;
+    expect(failure).toBeInstanceOf(SenderStalledError);
+    expect((failure as Error).message).not.toMatch(/acknowledgement/);
+    expect(sending.state, 'a frame it cannot use is not a failure').toBe('failed');
+  });
+
+  it('cancels before the offer arrives, without ever accepting', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const sink = new SpySink();
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(
+      peer.channel,
+      key,
+      { size: 1000n },
+      sink,
+      { fileIndex: WIRE_INDEX },
+    );
+
+    const running = receiver.run(controller.signal);
+    await settle();
+    controller.abort();
+
+    await expect(running).rejects.toThrowError(TransferCancelledError);
+    expect(peer.controls()).toEqual([{ t: 'cancel', index: WIRE_INDEX }]);
+    expect(sink.writes).toBe(0);
+    expect(sink.aborts, 'a destination opened and never used is still released').toBe(1);
+    // A close is deferred by a turn, so the assertion has to outlast the turn
+    // it is looking for.
+    await settle();
+    expect(peer.closeCalls()).toBe(0);
+    expect(receiver.state).toBe('cancelled');
+  });
+
+  it('still cancels when the abort lands as the last chunk arrives', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = 400;
+    const sink = new SpySink();
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(peer.channel, key, { size: BigInt(size) }, sink, {
+      fileIndex: WIRE_INDEX,
+      onProgress: () => controller.abort(),
+    });
+
+    const running = receiver.run(controller.signal);
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(await firstChunk(key, BigInt(size), size));
+    // The file is complete and the sender's done is already in the receiver's
+    // hands when the abort fires from the write that finished it.
+    peer.deliver(serializeControl({ t: 'done' }));
+
+    await expect(running).rejects.toThrowError(TransferCancelledError);
+    expect(receiver.state).toBe('cancelled');
+    expect(sink.closes, 'a file the receiver stopped is not kept').toBe(0);
+    expect(sink.aborts).toBe(1);
+    await settle();
+    expect(peer.closeCalls()).toBe(0);
+  });
+
+  it('a cancel outranks a stall that has already fired', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 2);
+    const held = new SpySink();
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(
+      peer.channel,
+      key,
+      { size },
+      {
+        write: (chunk) => gate.then(() => held.write(chunk)),
+        close: () => held.close(),
+        abort: () => held.abort(),
+      },
+      { fileIndex: WIRE_INDEX, stallTimeoutMs: 30 },
+    );
+
+    const running = receiver.run(controller.signal);
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(await firstChunk(key, size, CHUNK_SIZE));
+    // Parked in the write with the stall already expired behind it.
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    controller.abort();
+    release();
+
+    await expect(running).rejects.toThrowError(TransferCancelledError);
+    // One abort, one cancel, no close: the user asked for this, so it must not
+    // also be reported as a stall the sender has to be told off about.
+    expect(held.aborts).toBe(1);
+    expect(peer.controls()).toContainEqual({ t: 'cancel', index: WIRE_INDEX });
+    expect(peer.controls().filter((c) => c.t === 'error')).toEqual([]);
+    await settle();
+    expect(peer.closeCalls()).toBe(0);
+    expect(receiver.state).toBe('cancelled');
+  });
+
+  // Cancels a receiver part-way through the file and hands back the engine,
+  // which is now waiting to hear that the sender has stopped sending that file.
+  // Every drain test needs that state, and building it by hand each time is how
+  // the part that matters gets left out.
+  const cancelledInFlight = async (
+    peer: ReturnType<typeof createManualPeer>,
+    key: CryptoKey,
+    size: bigint,
+  ): Promise<{ receiver: ReceiverEngine; sink: SpySink }> => {
+    const sink = new SpySink();
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(peer.channel, key, { size }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const running = receiver.run(controller.signal);
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(await firstChunk(key, size, CHUNK_SIZE));
+    await settle();
+    controller.abort();
+
+    await expect(running).rejects.toThrowError(TransferCancelledError);
+    expect(sink.aborts).toBe(1);
+    return { receiver, sink };
+  };
+
+  // What a sender cannot take back. It cannot run faster than the round trip, so
+  // a cancel always lands with some of the file still on its way.
+  const inFlight = async (
+    key: CryptoKey,
+    size: bigint,
+    count: number,
+    from = 1n,
+  ): Promise<ArrayBuffer[]> =>
+    Promise.all(
+      Array.from({ length: count }, (_unused, i) =>
+        firstChunk(key, size, CHUNK_SIZE, from + BigInt(i)),
+      ),
+    );
+
+  // Resolves 'held' if the engine is still waiting and 'free' once it lets go,
+  // after a turn for a promise that is already settled to win the race.
+  const holdState = async (released: Promise<unknown>): Promise<'held' | 'free'> => {
+    const settled = released.then(() => 'free' as const);
+    await settle();
+    return Promise.race([settled, settle().then(() => 'held' as const)]);
+  };
+
+  // Runs a file all the way out and leaves the engine in the one slot a frame
+  // it cannot use can land in: sent, waiting for the receiver's acknowledgement.
+  const sentAndWaiting = async (
+    key: CryptoKey,
+  ): Promise<{
+    peer: ReturnType<typeof createManualPeer>;
+    engine: SenderEngine;
+    running: Promise<unknown>;
+  }> => {
+    const peer = createManualPeer();
+    const engine = new SenderEngine(peer.channel, randomBlob(CHUNK_SIZE + 3), key, {
+      fileIndex: WIRE_INDEX,
+    });
+    // Held from the start: a frame read as a protocol error rejects this while
+    // the test is still watching the engine, and an unwatched rejection is
+    // noise that hides a real one.
+    const running = engine.run().then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    await settle();
+    peer.deliver(serializeControl({ t: 'accept' }));
+    await settle();
+    expect(engine.state, 'the file is out and unacknowledged').toBe('sent');
+    return { peer, engine, running };
+  };
+
+  it('reads a cancel for a file it is not serving as no answer at all', async () => {
+    // A cancel the session ignored -- one naming a file that is not in flight --
+    // still reaches this engine, because a channel hands every frame to every
+    // subscriber and has no way to detach one. It lands in the one slot the
+    // engine cannot use it in: where the receiver's own done is due. Failing
+    // there ends the share over a file the receiver never asked to stop, and
+    // taking it for the answer would call a delivered file unconfirmed.
+    const key = await importRawKey(await generateRawKey());
+    const { peer, engine, running } = await sentAndWaiting(key);
+
+    peer.deliver(serializeControl({ t: 'cancel', index: WIRE_INDEX + 1 }));
+    // And a terminator the peer has no standing to send, which the session drops
+    // for the same reason and this engine must not mistake for its answer.
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX + 1 }));
+    expect(await holdState(running), 'a frame it cannot use must not settle the wait').toBe('held');
+
+    // What the peer really owed is behind them, and is still read.
+    peer.deliver(serializeControl({ t: 'done' }));
+    expect(await within(1000, running), 'the acknowledgement behind them is the answer').toBeNull();
+    expect(engine.state).toBe('completed');
+    expect(
+      peer.controls().filter((c) => c.t === 'error'),
+      'nothing was wrong with this transfer, so nothing was reported',
+    ).toEqual([]);
+  });
+
+  it('fails a transfer on a peer that sprays cancels, rather than waiting on it', async () => {
+    // The bound on the leniency above. Each frame the engine steps over re-arms
+    // the stall timer as it comes in, so without a ceiling a peer could hold a
+    // transfer open -- and the share with it -- for as long as it kept sending.
+    // One transfer has one cancel in it, so no honest peer produces this.
+    const key = await importRawKey(await generateRawKey());
+    const { peer, engine, running } = await sentAndWaiting(key);
+    for (let i = 0; i <= MAX_STEPPED_FRAMES; i += 1) {
+      peer.deliver(serializeControl({ t: 'cancel', index: WIRE_INDEX + 1 }));
+    }
+    // A spray is not a transfer, so what follows it changes nothing.
+    peer.deliver(serializeControl({ t: 'done' }));
+
+    const failure = await within(1000, running);
+    expect(failure).toBeInstanceOf(ProtocolError);
+    expect((failure as Error).message).toMatch(/cancel frames/i);
+    expect(engine.state).toBe('failed');
+  });
+
+  it('still refuses a select where the acknowledgement goes', async () => {
+    // The leniency is for the two frames the session answers and for nothing
+    // else. A select is the session's to act on and names no file this engine
+    // could answer, and the peer that sent it owes an acknowledgement, not a
+    // request: stepping over it would leave the engine waiting on a peer that
+    // has stopped speaking to it.
+    const key = await importRawKey(await generateRawKey());
+    const { peer, engine, running } = await sentAndWaiting(key);
+    peer.deliver(serializeControl({ t: 'select', index: WIRE_INDEX + 1 }));
+
+    const failure = await within(1000, running);
+    expect(failure).toBeInstanceOf(ProtocolError);
+    expect((failure as Error).message).toMatch(/acknowledgement but received "select"/);
+    expect(engine.state).toBe('failed');
+  });
+
+  it('still refuses a malformed frame where the consent goes', async () => {
+    // A frame that is not a control message at all is nobody's to answer, and
+    // parsing it leniently -- as the session does to spot a cancel -- would be
+    // how a broken peer turned into a cancel. It fails the transfer instead.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const engine = new SenderEngine(peer.channel, randomBlob(CHUNK_SIZE), key, {
+      fileIndex: WIRE_INDEX,
+    });
+    const running = engine.run().then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    await settle();
+    peer.deliver('{not a control message');
+
+    const failure = await within(1000, running);
+    expect(failure).toBeInstanceOf(ProtocolError);
+    expect((failure as Error).message).toMatch(/malformed control message/i);
+    expect(engine.state).toBe('failed');
+  });
+
+  it('still refuses file data where the acknowledgement goes', async () => {
+    // The leniency is for two control frames, not for bytes. A chunk arriving
+    // here is a leftover from a file this engine was not sending -- the drain
+    // exists because a channel cannot detach a subscriber -- and treating it as
+    // a frame to step over would be a file's worth of silence read as consent.
+    const key = await importRawKey(await generateRawKey());
+    const { peer, engine, running } = await sentAndWaiting(key);
+    peer.deliver(await firstChunk(key, BigInt(CHUNK_SIZE + 3), CHUNK_SIZE));
+
+    const failure = await within(1000, running);
+    expect(failure).toBeInstanceOf(ProtocolError);
+    expect((failure as Error).message).toMatch(/received file data/);
+    expect(engine.state).toBe('failed');
+  });
+
+  it('holds the channel until the sender says the last of the file has gone', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 8);
+    const { receiver, sink } = await cancelledInFlight(peer, key, size);
+
+    // A sender that keeps going regardless: the chunks it had already put on
+    // the wire when the cancel was sent, and the file's own done, which it had
+    // earned by finishing just before the cancel arrived.
+    for (const frame of await inFlight(key, size, 3)) peer.deliver(frame);
+    await settle();
+    expect(sink.writes, 'a discarded chunk is never written').toBe(1);
+    expect(receiver.state, 'a leftover must not turn a skip into a failure').toBe('cancelled');
+
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    expect(
+      await holdState(receiver.released),
+      'the sender said the last one had gone and the engine went on listening',
+    ).toBe('free');
+  });
+
+  it('goes on holding while the sender is still sending, terminator or not', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 8);
+    const { receiver } = await cancelledInFlight(peer, key, size);
+
+    for (const frame of await inFlight(key, size, 2)) peer.deliver(frame);
+    expect(
+      await holdState(receiver.released),
+      'the engine let the next file in while the sender was still sending this one',
+    ).toBe('held');
+
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    expect(await holdState(receiver.released)).toBe('free');
+  });
+
+  it('gives the drain up when the terminator never comes', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const key = await importRawKey(await generateRawKey());
+      const peer = createManualPeer();
+      const size = BigInt(CHUNK_SIZE * 4);
+      const { receiver } = await cancelledInFlight(peer, key, size);
+      expect(await holdState(receiver.released), 'nothing was sent after the cancel').toBe('held');
+
+      // A sender that never says so must not leave this engine subscribed for
+      // the rest of the share. The race is the assertion: without the deadline
+      // the engine is still holding when the clock runs out.
+      const outcome = await Promise.race([
+        receiver.released.then(() => 'released' as const),
+        vi.advanceTimersByTimeAsync(DEFAULT_STALL_TIMEOUT_MS + 1).then(
+          () => 'deadline' as const,
+        ),
+      ]);
+
+      expect(outcome).toBe('released');
+      expect(receiver.state).toBe('cancelled');
+      expect(peer.closeCalls(), 'a drain that gave up still does not end the share').toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('lets go when the peer leaves mid-drain', async () => {
+    // A channel that has closed has nothing left to come, so the drain is over
+    // whether the sender said so or not -- and a session waiting on this must
+    // not wait out a deadline for a peer that has already gone.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 4);
+    const { receiver } = await cancelledInFlight(peer, key, size);
+    expect(await holdState(receiver.released)).toBe('held');
+
+    peer.drop('remote');
+
+    expect(await holdState(receiver.released)).toBe('free');
+  });
+
+  it('holds nothing back for a transfer that was never cancelled', async () => {
+    // The wait is on every file, not only the skipped ones: an engine that only
+    // released itself from a cancel would make the second file of an ordinary
+    // share wait out a drain that was never started.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = 400;
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(peer.channel, key, { size: BigInt(size) }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const running = receiver.run();
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(await firstChunk(key, BigInt(size), size));
+    await settle();
+    peer.deliver(serializeControl({ t: 'done' }));
+    await running;
+
+    expect(receiver.state).toBe('completed');
+    expect(await holdState(receiver.released)).toBe('free');
+  });
+
+  it('holds nothing back for a transfer that failed', async () => {
+    // The same wait, the other way round: a failure closes the channel, and a
+    // released that never came would leave the next select waiting out a
+    // deadline for a file that is already over.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(peer.channel, key, { size: 1000n }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const running = receiver.run();
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    // More than the file declared, which fails before anything is written.
+    peer.deliver(await firstChunk(key, 1000n, 2000));
+
+    await expect(running).rejects.toThrowError(/more data than it declared/i);
+    expect(receiver.state).toBe('failed');
+    expect(await holdState(receiver.released)).toBe('free');
+  });
+
+  it('fails the next file on a frame that outlived the drain, without writing it', async () => {
+    // The limit of the drain, recorded rather than solved: a sender that never
+    // sends the terminator has told the receiver, by its silence, that nothing
+    // was coming. A frame that turns up after the drain has ended is the other
+    // case, and the next engine is subscribed by then, so it meets a chunk it
+    // was never offered. What it must not do is write it.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 4);
+    await cancelledInFlight(peer, key, size);
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    await settle();
+
+    const kept = new SpySink();
+    const second = new ReceiverEngine(peer.channel, key, { size }, kept, {
+      fileIndex: WIRE_INDEX + 1,
+    });
+    const keeping = second.run();
+    peer.deliver((await inFlight(key, size, 1))[0] as ArrayBuffer);
+
+    await expect(keeping).rejects.toThrowError(/file data/i);
+    expect(kept.writes, 'a chunk of another file is not written into this one').toBe(0);
+    expect(second.state).toBe('failed');
+  });
+
+  it('drains the leftovers away before the next engine subscribes', async () => {
+    // The engine cannot end the share on its own, because a channel hands every
+    // frame to every subscriber and has no way to detach one -- so this test
+    // passes with or without the drain, and guards only against a future fix
+    // that makes a settled engine swallow everything that follows. The test
+    // that carries the property is in session.test.ts: 'sends a cancel for the
+    // wire index, and keeps the channel for the next file'.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE + 40);
+    const { receiver: stopped } = await cancelledInFlight(peer, key, size);
+    expect(stopped.state).toBe('cancelled');
+
+    // A sender in no hurry to oblige: the rest of the cancelled file, its done,
+    // and only then the news that there is nothing more coming.
+    for (const frame of await inFlight(key, size, 2)) peer.deliver(frame);
+    peer.deliver(serializeControl({ t: 'done' }));
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    await settle();
+
+    const kept = new SpySink();
+    const second = new ReceiverEngine(
+      peer.channel,
+      key,
+      { size },
+      kept,
+      { fileIndex: WIRE_INDEX + 1 },
+    );
+    const keeping = second.run();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(Number(size)),
+        WIRE_INDEX + 1,
+        0n,
+        buildBinding(CHUNK_DOMAIN, WIRE_INDEX + 1, size),
+      ),
+    );
+    peer.deliver(serializeControl({ t: 'done' }));
+    await keeping;
+
+    expect(second.state).toBe('completed');
+    expect(kept.byteLength).toBe(Number(size));
+    expect(peer.closeCalls(), 'the whole share turned on this').toBe(0);
+  });
+
+  it('steps over a terminator that lands after the drain has let the next file in', async () => {
+    // The drain ends on any control frame, and a sender that finished the file
+    // just as the cancel was in flight puts its own done on the wire first. So a
+    // terminator can legitimately turn up at the next file's engine, which is
+    // already waiting for an offer. It is a statement about the file that has
+    // gone, and the session drops it as well; failing here would end a share
+    // that is only beginning over a frame that says nothing about this file.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE + 40);
+    await cancelledInFlight(peer, key, size);
+    // The file's own done, which the sender had earned by finishing as the
+    // cancel went out, and which ends the drain ahead of the terminator.
+    peer.deliver(serializeControl({ t: 'done' }));
+    await settle();
+
+    const kept = new SpySink();
+    const second = new ReceiverEngine(peer.channel, key, { size }, kept, {
+      fileIndex: WIRE_INDEX + 1,
+    });
+    const receiving = second.run();
+    peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    await settle();
+    expect(
+      await holdState(receiving),
+      'a terminator for a file that has gone must not settle the next one',
+    ).toBe('held');
+
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    peer.deliver(
+      await encryptChunk(
+        key,
+        new Uint8Array(Number(size)),
+        WIRE_INDEX + 1,
+        0n,
+        buildBinding(CHUNK_DOMAIN, WIRE_INDEX + 1, size),
+      ),
+    );
+    peer.deliver(serializeControl({ t: 'done' }));
+    await receiving;
+
+    expect(second.state).toBe('completed');
+    expect(kept.byteLength).toBe(Number(size));
+    expect(peer.closeCalls()).toBe(0);
+  });
+
+  it('fails a transfer on a peer that sprays terminators before the offer', async () => {
+    // The bound on that leniency. Every frame stepped over re-arms the stall
+    // timer as it comes in, so a peer that kept sending them would hold this
+    // engine -- and the file after it with it -- for as long as it cared to.
+    // One transfer has one cancel in it, so no honest peer produces this.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE + 40);
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(peer.channel, key, { size }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const receiving = receiver.run();
+    for (let i = 0; i <= MAX_STEPPED_FRAMES; i += 1) {
+      peer.deliver(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+    }
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+
+    await expect(receiving).rejects.toThrowError(ProtocolError);
+    await expect(receiving).rejects.toThrowError(/terminator frames/i);
+    expect(receiver.state).toBe('failed');
+    expect(sink.writes).toBe(0);
+  });
+
+  it('still refuses a frame that is not a terminator where the offer goes', async () => {
+    // The leniency is for the one frame that is a late answer to a question
+    // about a file that has gone, and for nothing else. A done is the sender
+    // announcing a file this engine was never offered, and reading it as nothing
+    // in particular would be a receiver that never learned whether a transfer
+    // had started.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(peer.channel, key, { size: 1000n }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const receiving = receiver.run();
+    peer.deliver(serializeControl({ t: 'done' }));
+
+    await expect(receiving).rejects.toThrowError(ProtocolError);
+    await expect(receiving).rejects.toThrowError(/Expected an offer but received "done"/);
+    expect(receiver.state).toBe('failed');
+  });
+
+  it('still refuses a terminator where a chunk of the transfer goes', async () => {
+    // The receiver steps over a late terminator only where the OFFER goes. Once
+    // a transfer is under way it owns every frame that arrives, and a terminator
+    // there is a sender talking about a file this one is not -- the same widening
+    // that would make the offer lenient would make this lenient too, and
+    // nothing would fail.
+    const key = await importRawKey(await generateRawKey());
+    const { a, b } = createLoopbackPair();
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(b, key, { size: BigInt(CHUNK_SIZE * 4) }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+    // Held from the start: it rejects while the sender below is still being
+    // awaited, and an unwatched rejection in between is an unhandled one.
+    const receiving = receiver.run();
+    const outcome = receiving.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+
+    // A real sender, so the offer and the accept are genuine, interrupted once
+    // the transfer is under way.
+    let interrupted = false;
+    const sending = new SenderEngine(
+      a,
+      randomBlob(CHUNK_SIZE * 4),
+      key,
+      {
+        fileIndex: WIRE_INDEX,
+        pollIntervalMs: 0,
+        onProgress: (sent) => {
+          if (interrupted || sent === 0n) return;
+          interrupted = true;
+          a.send(serializeControl({ t: 'cancelled', index: WIRE_INDEX }));
+        },
+      },
+    ).run();
+    await sending.catch(() => undefined);
+
+    const thrown = await outcome;
+    expect(thrown).toBeInstanceOf(ProtocolError);
+    expect(String(thrown)).toMatch(/Unexpected "cancelled" during transfer/);
+    expect(sink.writes, 'no chunk had been offered to write before this').toBeLessThan(4);
+  });
+
+  it('a stall with no signal is still an ordinary failure', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const sink = new SpySink();
+    const controller = new AbortController();
+    const receiver = new ReceiverEngine(peer.channel, key, { size: 1000n }, sink, {
+      fileIndex: WIRE_INDEX,
+      stallTimeoutMs: 5,
+    });
+
+    const running = receiver.run(controller.signal);
+    // Watched from the start: the stall can fire before this test has finished
+    // settling, and a rejection nobody is holding yet is reported as unhandled.
+    const failure = running.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    await settle();
+
+    expect(await failure).toBeInstanceOf(TransferStalledError);
+    expect(await failure).not.toBeInstanceOf(TransferCancelledError);
+    expect(receiver.state).toBe('failed');
+    expect(sink.aborts).toBe(1);
+    expect(peer.controls().filter((c) => c.t === 'cancel')).toEqual([]);
+    await settle();
+    expect(peer.closeCalls(), 'a stall still ends the connection').toBe(1);
+  });
+
+  it('hands its abort listener back on every chunk it parks on', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const size = BigInt(CHUNK_SIZE * 6);
+    const signal = countingSignal();
+    const sink = new SpySink();
+    const receiver = new ReceiverEngine(peer.channel, key, { size }, sink, {
+      fileIndex: WIRE_INDEX,
+    });
+
+    const running = receiver.run(signal.signal);
+    await settle();
+    peer.deliver(serializeControl({ t: 'offer', chunkSize: CHUNK_SIZE }));
+    await settle();
+    for (let i = 0; i < 6; i += 1) {
+      peer.deliver(await firstChunk(key, size, CHUNK_SIZE, BigInt(i)));
+      await settle();
+    }
+    peer.deliver(serializeControl({ t: 'done' }));
+    await running;
+
+    expect(receiver.state).toBe('completed');
+    expect(signal.added(), 'the engine really did park on the signal').toBeGreaterThan(1);
+    expect(signal.removed(), 'a listener per chunk outlives the transfer').toBe(signal.added());
+  });
+});
+
+// The frame this exists for is the sender engine's, and it is asserted here
+// rather than in session.test.ts because what matters is the whole sequence the
+// sender put on the wire, terminator included. The session's own half -- that it
+// intercepts the cancel and answers it -- is covered there.
+describe('a cancel before the receiver accepts', () => {
+  it('says nothing about the sender having stopped, and answers the cancel', async () => {
+    // The window where a cancel costs the least: the file is offered and not yet
+    // taken, so there is nothing on the wire to drain and nothing half-written.
+    // It is also where the sender is most tempted to talk, because cutting the
+    // wait short looks exactly like a sender that has given up. "The sender
+    // stopped sharing." is false here -- the share carries on to the next file
+    // on the same connection -- and a receiver that is not this one would read
+    // it as the share ending. It is also the frame the receiver's own drain is
+    // meant to end on instead.
+    const key = await importRawKey(await generateRawKey());
+    const peer = createManualPeer();
+    const files = [
+      new File([new Uint8Array(CHUNK_SIZE + 5)], 'a.bin'),
+      new File([new Uint8Array(64)], 'b.bin'),
+    ];
+    const failures: string[] = [];
+    const completed: number[] = [];
+    const sender = new SenderSession(peer.channel, key, files, {
+      pollIntervalMs: 0,
+      onError: (_index, message) => failures.push(message),
+      onComplete: (index) => completed.push(index),
+    });
+    const serving = sender.run();
+    await settle();
+    // The manifest is a binary frame of its own, so the file's frames are
+    // counted from here rather than from an empty channel.
+    const beforeSelect = peer.frames().length;
+    peer.deliver(serializeControl({ t: 'select', index: FIRST_FILE_INDEX }));
+    await settle();
+
+    // The offer is out and no accept has come: this is the consent window.
+    expect(peer.frames().length, 'nothing of the file is on the wire yet').toBe(beforeSelect);
+    peer.deliver(serializeControl({ t: 'cancel', index: FIRST_FILE_INDEX }));
+    await settle();
+
+    // The whole sequence, in order, so the frame cannot come back in another
+    // position: the offer, and the one frame the receiver is waiting for.
+    expect(peer.controls()).toEqual([
+      { t: 'offer', chunkSize: CHUNK_SIZE },
+      { t: 'cancelled', index: FIRST_FILE_INDEX },
+    ]);
+    expect(failures, 'the receiver asked for this, so it is not a failure').toEqual([]);
+    expect(completed, 'a file that was declined is not a delivery').toEqual([]);
+
+    peer.deliver(serializeControl({ t: 'select', index: FIRST_FILE_INDEX + 1 }));
+    await settle();
+    peer.deliver(serializeControl({ t: 'accept' }));
+    await settle();
+    peer.deliver(serializeControl({ t: 'done' }));
+    await settle();
+
+    expect(completed, 'the share goes on to the next file').toEqual([1]);
+    peer.deliver(serializeControl({ t: 'finish' }));
+    await expect(serving).resolves.toBeUndefined();
+  });
+});
+
+// A wire the test drives: a send puts a frame on it and nothing arrives until
+// the test says so, and the sender is held in its backpressure wait until it is
+// released. Loopback hands a frame over in the same tick as the send, so frames a
+// peer has to read in the opposite order can pass there and fail over a real
+// connection, where the second is a round trip behind the first.
+const createDeferredPair = () => {
+  const inbound: ((msg: ChannelMessage) => void)[][] = [[], []];
+  const closers: ((reason: CloseReason) => void)[][] = [[], []];
+  // Addressed to that end, so a send is a put on the wire and a delivery is a
+  // read of the far end's box.
+  const addressed: ChannelMessage[][] = [[], []];
+  const closed = [false, false];
+  let held = true;
+
+  const end = (self: number): Channel => ({
+    send: (msg) => {
+      if (closed[self] === true) return;
+      addressed[1 - self]?.push(msg);
+    },
+    onMessage: (cb) => {
+      inbound[self]?.push(cb);
+    },
+    onClose: (cb) => {
+      closers[self]?.push(cb);
+    },
+    close: () => {
+      const remote = 1 - self;
+      if (closed[self] === true || closed[remote] === true) return;
+      closed[self] = true;
+      closed[remote] = true;
+      for (const cb of closers[self] ?? []) cb('local');
+      for (const cb of closers[remote] ?? []) cb('remote');
+    },
+    get bufferedAmount() {
+      return held ? Number.MAX_SAFE_INTEGER : 0;
+    },
+  });
+
+  return {
+    a: end(0),
+    b: end(1),
+    // One frame per end, because that is what a wire hands over: the second of a
+    // pair is a round trip behind the first, which is the whole difference here.
+    // A frame a handler sends while this runs waits for the next round.
+    deliver: (): void => {
+      for (const to of [0, 1]) {
+        const msg = addressed[to]?.shift();
+        if (msg === undefined) continue;
+        for (const cb of inbound[to] ?? []) cb(msg);
+      }
+    },
+    release: (): void => {
+      held = false;
+    },
+  };
+};
+
+// A turn of the event loop between deliveries, which is what lets each engine
+// reach its next await before the next frame lands.
+const pump = async (rounds: number, deliver: () => void): Promise<void> => {
+  for (let round = 0; round < rounds; round += 1) {
+    await settle();
+    deliver();
+  }
+};
+
+const fileOf = async (size: number, name: string): Promise<File> =>
+  new File([await randomBlob(size).arrayBuffer()], name);
+
+// The frames the sender puts on the wire, as one session's peer sees them.
+const fromSender = (channel: Channel): ControlMessage[] => {
+  const controls: ControlMessage[] = [];
+  channel.onMessage((msg) => {
+    if (typeof msg === 'string') controls.push(parseControl(msg));
+  });
+  return controls;
+};
+
+describe('a sender that is cut short', () => {
+  it('says nothing at all, and the next file still arrives', async () => {
+    // The whole round trip, over a real channel, with the sender's own frames
+    // counted. "The sender stopped sharing." is the one frame the receiver's
+    // drain is meant to end on, so putting it out on this path is what ends the
+    // drain early and hands the terminator behind it to the next file.
+    const key = await importRawKey(await generateRawKey());
+    const { a, b } = createLoopbackPair();
+    const seen = fromSender(b);
+    const files = [await fileOf(CHUNK_SIZE * 40, 'skipped.bin'), await fileOf(64, 'next.bin')];
+    const failures: string[] = [];
+    const completed: number[] = [];
+    const controller = new AbortController();
+    const sender = new SenderSession(a, key, files, {
+      pollIntervalMs: 0,
+      onError: (_index, message) => failures.push(message),
+      onComplete: (index) => completed.push(index),
+    });
+    const sinks: SpySink[] = [];
+    const receiver = new ReceiverSession(b, key, {
+      openSink: async () => {
+        const sink = new SpySink();
+        sinks.push(sink);
+        return sink;
+      },
+      onManifest: () => {},
+      onProgress: (_index, received) => {
+        if (received > 0n) controller.abort();
+      },
+    });
+    const serving = sender.run();
+    await receiver.run();
+    await settle();
+
+    await expect(receiver.select(0, controller.signal)).rejects.toThrowError(
+      TransferCancelledError,
+    );
+    await receiver.select(1);
+    await receiver.finish();
+    await expect(serving).resolves.toBeUndefined();
+
+    expect(seen.filter((control) => control.t === 'error')).toEqual([]);
+    expect(seen.map((control) => control.t)).toEqual([
+      'offer',
+      'cancelled',
+      'offer',
+      'done',
+    ]);
+    expect(completed).toEqual([1]);
+    expect(failures).toEqual([]);
+    expect(sinks).toHaveLength(2);
+  });
+
+  it('keeps the share when the terminator is a round trip behind the cancel', async () => {
+    // The hazard, with the wire in the shape that has it. The sender's own
+    // answer to a cancel is the terminator, and it goes out after everything the
+    // engine had already sent -- so on a real connection it arrives long after
+    // the receiver has stopped discarding. Anything the sender says on the way
+    // out ends the drain first, and the terminator then belongs to the next
+    // file's engine, which has no reason to expect it and closes the channel.
+    const key = await importRawKey(await generateRawKey());
+    const wire = createDeferredPair();
+    const seen = fromSender(wire.b);
+    const files = [await fileOf(CHUNK_SIZE * 4, 'skipped.bin'), await fileOf(64, 'next.bin')];
+    const failures: string[] = [];
+    const completed: number[] = [];
+    const sender = new SenderSession(wire.a, key, files, {
+      pollIntervalMs: 0,
+      onError: (_index, message) => failures.push(message),
+      onComplete: (index) => completed.push(index),
+    });
+    const sinks: SpySink[] = [];
+    const controller = new AbortController();
+    const receiver = new ReceiverSession(wire.b, key, {
+      openSink: async () => {
+        const sink = new SpySink();
+        sinks.push(sink);
+        return sink;
+      },
+      onManifest: () => {},
+      onProgress: (_index, received) => {
+        if (received > 0n) controller.abort();
+      },
+    });
+    const serving = sender.run();
+    const connecting = receiver.run();
+    await pump(2, wire.deliver);
+    await connecting;
+
+    const skipping = receiver.select(0, controller.signal);
+    const cancelled = skipping.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    await pump(8, wire.deliver);
+    expect(await within(1000, cancelled)).toBeInstanceOf(TransferCancelledError);
+    expect(
+      seen.filter((control) => control.t === 'cancelled'),
+      'the cancel is on the wire and the sender has not read it yet',
+    ).toEqual([]);
+
+    // Read now, while the sender is still parked mid-file with three chunks of
+    // it to go. This is the common cancel path, and the one that used to put an
+    // error frame on the wire ahead of the terminator.
+    await settle();
+    wire.deliver();
+    await settle();
+    expect(
+      seen.filter((control) => control.t === 'cancelled'),
+      'the sender has been asked to stop and has said nothing yet',
+    ).toEqual([]);
+
+    // Asked for at once, so it is waiting on the drain when the sender's answer
+    // is still in flight, and the sender is still holding the rest of the file.
+    const second = receiver.select(1);
+    // Held from the start: the failure this test exists to catch arrives a whole
+    // round trip before the assertion that reads it, and an unwatched rejection
+    // in between is noise that hides a real one.
+    const secondOutcome = second.then(
+      () => null,
+      (cause: unknown) => cause,
+    );
+    wire.release();
+    await pump(60, wire.deliver);
+
+    expect(
+      seen.filter((control) => control.t === 'error'),
+      'a cancel is not the sender stopping, and the frame that says so ends the share',
+    ).toEqual([]);
+    await expect(secondOutcome).resolves.toBeNull();
+    expect(completed).toEqual([1]);
+    expect(failures).toEqual([]);
+    expect(sinks[1]?.byteLength).toBe(64);
+
+    await receiver.finish();
+    await pump(3, wire.deliver);
+    await expect(serving).resolves.toBeUndefined();
+  });
+
+  it('still tells the peer the sender stopped when the peer reports a failure', async () => {
+    // The one wait where the sender is not the party that asked to stop. The peer
+    // has said the transfer failed, so it will be waiting for whatever comes
+    // next, and silence would leave it to time out.
+    const peer = createManualPeer();
+    const engine = new SenderEngine(
+      peer.channel,
+      randomBlob(CHUNK_SIZE * 4),
+      await importRawKey(await generateRawKey()),
+      { fileIndex: FILE_INDEX },
+    );
+
+    const running = engine.run();
+    await settle();
+    // Whatever the peer said, verbatim. The text is the peer's to choose, so
+    // there is nothing here to match against production wording.
+    peer.deliver(serializeControl({ t: 'error', message: 'peer said no (arbitrary text)' }));
+
+    await expect(running).resolves.toBeUndefined();
+    expect(peer.controls().at(-1)).toEqual({
+      t: 'error',
+      message: 'The sender stopped sharing.',
+    });
+    expect(engine.state).toBe('aborted');
+  });
+
+  it('still fails and says so when the receiver goes quiet', async () => {
+    // A stall is the sender stopping, and it is a failure with a reason the peer
+    // can show. Going quiet about it would leave the peer to time out on its own
+    // timer and blame itself.
+    const peer = createManualPeer();
+    const engine = new SenderEngine(
+      peer.channel,
+      randomBlob(CHUNK_SIZE + 3),
+      await importRawKey(await generateRawKey()),
+      { fileIndex: FILE_INDEX, stallTimeoutMs: 30 },
+    );
+
+    const running = engine.run();
+    await settle();
+    peer.deliver(serializeControl({ t: 'accept' }));
+    await settle();
+
+    await expect(running).rejects.toThrowError(SenderStalledError);
+    expect(peer.controls().at(-1)).toMatchObject({ t: 'error' });
+    expect(peer.controls().at(-1)).toMatchObject({ message: expect.stringMatching(/went quiet/i) });
+    expect(engine.state).toBe('failed');
+  });
+
+  it('says nothing to a peer that has already gone', async () => {
+    // The third case that is a real stop, and the reason the sender's own report
+    // is not sent on the abort path either: a closed channel has nowhere to put
+    // it, and what the peer gets instead is the close it already knows about.
+    const { a, b } = createLoopbackPair();
+    const seen = fromSender(b);
+    playAcceptingReceiver(b);
+    const engine = new SenderEngine(
+      a,
+      randomBlob(CHUNK_SIZE * 500),
+      await importRawKey(await generateRawKey()),
+      { fileIndex: FILE_INDEX, onProgress: () => b.close(), pollIntervalMs: 0 },
+    );
+
+    await engine.run();
+
+    expect(engine.state).toBe('aborted');
+    expect(seen.filter((control) => control.t === 'error')).toEqual([]);
+    expect(seen.map((control) => control.t)).toEqual(['offer']);
   });
 });

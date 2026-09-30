@@ -1,6 +1,7 @@
 import { bech32m } from 'bech32';
 import { describe, expect, it } from 'vitest';
-import { decodeShare, encodeShare, HRP, TokenError } from './codec';
+import { ICE_SERVERS, isKnownIndex } from '../config/iceServers';
+import { decodeShare, encodeShare, HRP, MAX_RELAY_INDEX, TokenError } from './codec';
 import { mintSharePayload } from './mint';
 
 const sample = () => mintSharePayload();
@@ -17,6 +18,17 @@ const roomPrefix = (roomId: string): Uint8Array => {
   const bytes = new Uint8Array(1 + roomId.length);
   bytes[0] = roomId.length;
   bytes.set(new TextEncoder().encode(roomId), 1);
+  return bytes;
+};
+
+// The 54 bytes this app minted before the relay byte existed: a room code
+// length, the room code, a key length and the key, and nothing after them.
+const legacyPayload = (roomId: string, key: Uint8Array): Uint8Array => {
+  const prefix = roomPrefix(roomId);
+  const bytes = new Uint8Array(prefix.length + 1 + key.length);
+  bytes.set(prefix);
+  bytes[prefix.length] = key.length;
+  bytes.set(key, prefix.length + 1);
   return bytes;
 };
 
@@ -37,21 +49,33 @@ describe('encodeShare and decodeShare', () => {
     expect(decoded.key).toEqual(original.key);
   });
 
-  it('encodes to 98 characters, so a share link stays well under 200', async () => {
+  it('encodes to 99 characters, so a share link stays well under 200', async () => {
     const token = encodeShare(await sample());
     expect(token.startsWith(`${HRP}1`)).toBe(true);
-    expect(token.length).toBe(98);
+    expect(token.length).toBe(99);
     expect(token.length).toBeLessThan(200);
   });
 
-  it('lays the payload out as a room length, a room, a key length, and a key', async () => {
+  it('lays the payload out as a room length, a room, a key length, a key, and a relay', async () => {
     const payload = await sample();
     const bytes = payloadBytes(encodeShare(payload));
-    expect(bytes.byteLength).toBe(54);
+    expect(bytes.byteLength).toBe(55);
     expect(bytes[0]).toBe(20);
     expect(new TextDecoder().decode(bytes.subarray(1, 21))).toBe(payload.roomId);
     expect(bytes[21]).toBe(32);
-    expect(bytes.subarray(22)).toEqual(payload.key);
+    expect(bytes.subarray(22, 54)).toEqual(payload.key);
+    expect(bytes[54]).toBe(payload.relay);
+  });
+
+  it('grows the payload by exactly one byte for the relay, and by none without it', async () => {
+    const { roomId, key } = await sample();
+    const withRelay = payloadBytes(encodeShare({ roomId, key, relay: 7 }));
+    const without = payloadBytes(encodeShare({ roomId, key, relay: null }));
+    expect(withRelay.byteLength).toBe(55);
+    expect(without.byteLength).toBe(54);
+    expect(withRelay.subarray(0, 54)).toEqual(without);
+    expect(withRelay[54]).toBe(7);
+    expect(without[54]).toBeUndefined();
   });
 
   it('tolerates whitespace from a paste', async () => {
@@ -215,5 +239,73 @@ describe('encodeShare and decodeShare', () => {
       expect(thrown).not.toBeInstanceOf(RangeError);
       expect((thrown as TokenError).code).toBe('malformed');
     }
+  });
+
+  it('carries a relay index and reads it back', async () => {
+    const original = { ...(await sample()), relay: 2 };
+    const decoded = decodeShare(encodeShare(original));
+    expect(decoded.relay).toBe(2);
+  });
+
+  it('round-trips relay index zero as zero and not as absent', async () => {
+    const token = encodeShare({ ...(await sample()), relay: 0 });
+    expect(payloadBytes(token)[54]).toBe(0);
+    const decoded = decodeShare(token);
+    // Zero is the table's first entry, and the fallback at the point of use is
+    // a nullish coalesce, so any consumer that reached for `||` would silently
+    // land on the default instead.
+    expect(decoded.relay).toBe(0);
+    expect(decoded.relay).not.toBeNull();
+  });
+
+  it('reads a 54-byte token minted before the relay field existed', async () => {
+    const { roomId, key } = await sample();
+    const legacy = legacyPayload(roomId, key);
+    expect(legacy.byteLength).toBe(54);
+    const decoded = decodeShare(forgeToken(legacy));
+    expect(decoded.roomId).toBe(roomId);
+    expect(decoded.key).toEqual(key);
+    expect(decoded.relay).toBeNull();
+  });
+
+  it('rejects a 56-byte token rather than ignoring the extra bytes', async () => {
+    const { roomId, key } = await sample();
+    const over = new Uint8Array(legacyPayload(roomId, key).byteLength + 2);
+    over.set(legacyPayload(roomId, key));
+    over[54] = 1;
+    over[55] = 2;
+    expect(() => decodeShare(forgeToken(over))).toThrowError(TokenError);
+    expect(messageOf(forgeToken(over))).toMatch(/trailing data/i);
+  });
+
+  it('accepts the widest relay index a byte can hold and refuses the next one', async () => {
+    const payload = { ...(await sample()), relay: 255 };
+    expect(decodeShare(encodeShare(payload)).relay).toBe(255);
+    expect(() => encodeShare({ ...payload, relay: 256 })).toThrowError(TokenError);
+  });
+
+  it('refuses to encode a relay index that is not a whole byte', async () => {
+    const payload = await sample();
+    for (const relay of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+      let thrown: unknown;
+      try {
+        encodeShare({ ...payload, relay });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(TokenError);
+      expect((thrown as TokenError).code).toBe('malformed');
+    }
+  });
+
+  it('never resolves the relay index, so an index from a longer table still decodes', async () => {
+    const beyond = ICE_SERVERS.length + 100;
+    // The value has to stay inside the byte the encoder accepts, or this stops
+    // being the out-of-range case it is and becomes an encode failure. Asserted
+    // here so a future table length shows up as its own failure.
+    expect(beyond).toBeLessThanOrEqual(MAX_RELAY_INDEX);
+    const decoded = decodeShare(encodeShare({ ...(await sample()), relay: beyond }));
+    expect(isKnownIndex(beyond)).toBe(false);
+    expect(decoded.relay).toBe(beyond);
   });
 });

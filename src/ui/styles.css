@@ -184,3 +184,113 @@ details.advanced {
 details.advanced summary {
   cursor: pointer;
 }
+
+.advanced label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  cursor: pointer;
+}
+
+/* A STUN entry cannot be the designated relay, and the designated relay cannot be
+   switched off, so both of those controls are inert - dimmed and with a cursor
+   that says so rather than looking like a control that silently ignores a
+   click. */
+.advanced label:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* One bordered box per server. The checkbox and its radio are separate grid
+   cells rather than two children of one row, because the radios have to sit in
+   a single radiogroup; the border and the row dividers stand in for the row
+   box they used to be.
+
+   One row per server, counted by ShareTab from the same array these rows are
+   rendered from, because the relay group has to span all of them and `-1` can
+   only mean something in a grid with explicit rows. Writing the count here
+   instead meant a server appended to the table got a row the group never
+   reached, which put its checkbox in the radio column. */
+.server-list {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: repeat(var(--server-rows), 1fr);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+/* A real grid item in the second column, spanning all the rows, rather than
+   `display: contents`. The group carries an accessible name, and MDN still
+   warns that some implementations drop a `display: contents` element from the
+   accessibility tree. The explicit placement is load-bearing too: left to
+   auto-placement the rows fill the two columns in DOM order, which would put
+   the second checkbox in the relay column and leave the radios wrapped across
+   the last rows instead of each one beside its own server.
+
+   Its own rows take the same count, so the two columns divide the height the
+   same way and a divider in one sits opposite a divider in the other. The count
+   is still the one the table's length produced, so it is written down once. */
+.server-relays {
+  grid-column: 2;
+  grid-row: 1 / -1;
+  display: grid;
+  grid-template-rows: repeat(var(--server-rows), 1fr);
+}
+
+.server-row {
+  border: 0;
+  border-radius: 0;
+  padding: 0.35rem 0.7rem;
+}
+
+.server-list > .server-row + .server-row,
+.server-relays .server-row + .server-row {
+  border-top: 1px solid var(--line);
+}
+
+.server-row .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The base `button` rule is a pair: an accent fill with near-black text, set
+   together because that combination is legible. Overriding the fill without
+   the text leaves near-black on the dark panel, so every rule that changes the
+   background here must set `color` too, exactly as `button.secondary` does. */
+.file-row .menu {
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.1rem 0.5rem;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.menu-panel {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.menu-panel button {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 0.3rem 0.8rem;
+  cursor: pointer;
+}
+
+.queue {
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.queue-title {
+  font-size: 0.95rem;
+  margin: 0;
+}

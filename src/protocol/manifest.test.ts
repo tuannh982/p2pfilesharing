@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { decryptChunk, deriveNonce, encryptChunk, TAG_BYTES } from '../crypto/chunks';
+import {
+  BINDING_BYTES,
+  buildBinding,
+  CHUNK_DOMAIN,
+  decryptChunk,
+  DecryptionError,
+  deriveNonce,
+  encryptChunk,
+  MANIFEST_DOMAIN,
+  SIZE_BYTES,
+  TAG_BYTES,
+} from '../crypto/chunks';
 import { generateRawKey, importRawKey } from '../crypto/keys';
 import {
   decodeManifest,
@@ -10,6 +21,7 @@ import {
   MANIFEST_CHUNK_INDEX,
   MANIFEST_FILE_INDEX,
   ManifestError,
+  manifestBinding,
   MAX_FILES,
   MAX_MANIFEST_BYTES,
   MAX_NAME_BYTES,
@@ -17,6 +29,9 @@ import {
   type ManifestEntry,
   validateManifest,
 } from './manifest';
+
+const sizeField = (binding: Uint8Array<ArrayBuffer>): number[] =>
+  Array.from(binding.slice(BINDING_BYTES - SIZE_BYTES));
 
 const entries: ManifestEntry[] = [
   { name: 'photo.jpg', size: 1048576n },
@@ -159,7 +174,13 @@ describe('encrypted manifest frame', () => {
     const key = await importRawKey(await generateRawKey());
     const frame = await encryptManifest(key, entries);
     const plain = new TextDecoder().decode(
-      await decryptChunk(key, frame, MANIFEST_FILE_INDEX, MANIFEST_CHUNK_INDEX),
+      await decryptChunk(
+        key,
+        frame,
+        MANIFEST_FILE_INDEX,
+        MANIFEST_CHUNK_INDEX,
+        manifestBinding(),
+      ),
     );
     expect(JSON.parse(plain).files).toHaveLength(entries.length);
   });
@@ -201,13 +222,72 @@ describe('encrypted manifest frame', () => {
 
   it('fails when handed a frame encrypted at a real file index', async () => {
     const key = await importRawKey(await generateRawKey());
+    const body = new TextEncoder().encode('{"files":[]}');
     const fileFrame = await encryptChunk(
       key,
-      new TextEncoder().encode('{"files":[]}'),
+      body,
       FIRST_FILE_INDEX,
       0n,
+      buildBinding(CHUNK_DOMAIN, FIRST_FILE_INDEX, BigInt(body.byteLength)),
     );
     await expect(decryptManifest(key, fileFrame)).rejects.toThrow();
+  });
+});
+
+describe('the manifest binding', () => {
+  it('seals under the manifest domain, not the file-chunk domain', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const files = [{ name: 'a.bin', size: 100n }];
+    const frame = await encryptManifest(key, files);
+    await expect(
+      decryptChunk(
+        key,
+        frame,
+        MANIFEST_FILE_INDEX,
+        MANIFEST_CHUNK_INDEX,
+        buildBinding(CHUNK_DOMAIN, 0, 0n),
+      ),
+    ).rejects.toThrowError(DecryptionError);
+  });
+
+  it('still round-trips through the manifest helpers', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const files = [
+      { name: 'a.bin', size: 100n },
+      { name: 'b.bin', size: 200n },
+    ];
+    await expect(decryptManifest(key, await encryptManifest(key, files))).resolves.toEqual(files);
+  });
+
+  it('binds a zero size, not the length the manifest turned out to be', () => {
+    const plain = encodeManifest([{ name: 'a.bin', size: 100n }]);
+    expect(plain.byteLength).toBeGreaterThan(0);
+    expect(sizeField(manifestBinding())).toEqual([0, 0, 0, 0, 0, 0, 0, 0]);
+    expect(new Uint8Array(manifestBinding())).not.toEqual(
+      new Uint8Array(
+        buildBinding(MANIFEST_DOMAIN, MANIFEST_FILE_INDEX, BigInt(plain.byteLength)),
+      ),
+    );
+  });
+
+  it('takes no size, so a caller cannot hand it a length it does not have yet', () => {
+    expect(manifestBinding.length).toBe(0);
+  });
+
+  it('will not open a frame sealed under a binding that carries the real manifest length', async () => {
+    const key = await importRawKey(await generateRawKey());
+    const files = [{ name: 'a.bin', size: 100n }];
+    const frame = await encryptManifest(key, files);
+    const length = BigInt(encodeManifest(files).byteLength);
+    await expect(
+      decryptChunk(
+        key,
+        frame,
+        MANIFEST_FILE_INDEX,
+        MANIFEST_CHUNK_INDEX,
+        buildBinding(MANIFEST_DOMAIN, MANIFEST_FILE_INDEX, length),
+      ),
+    ).rejects.toThrowError(DecryptionError);
   });
 });
 
